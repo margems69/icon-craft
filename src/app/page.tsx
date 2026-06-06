@@ -2,12 +2,13 @@
 
 import { useState, useRef, useCallback, useEffect } from 'react';
 import Link from 'next/link';
+import { processImage } from '@/lib/clientIconProcessor';
 
 interface IconData { size: number; label: string; dataUrl: string; format: string; }
 interface ConversionResult {
   icons: IconData[]; zipDataUrl: string; originalName: string;
   originalWidth: number; originalHeight: number;
-  upscaled?: boolean; aiUsed?: boolean;
+  upscaled?: boolean;
 }
 
 const FORMATS = [
@@ -33,7 +34,6 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
-  const [useAI, setUseAI] = useState(true);
   const [selected, setSelected] = useState<IconData | null>(null);
   const [history, setHistory] = useState<{name:string;sizes:number;date:string}[]>([]);
   const [mounted, setMounted] = useState(false);
@@ -73,12 +73,7 @@ export default function Home() {
   const convert = async () => {
     if (!file) return; setLoading(true); setError(null);
     try {
-      const fd = new FormData(); fd.append('file', file); fd.append('useAI', String(useAI));
-      const res = await fetch('/api/convert', { method: 'POST', body: fd });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Conversion failed');
-      // Filter to enabled sizes
-      data.icons = data.icons.filter((i: IconData) => enabledSizes.includes(i.size));
+      const data = await processImage(file, enabledSizes);
       setResult(data);
       setSelected(data.icons[0]);
       const entry = { name: data.originalName, sizes: data.icons.length, date: new Date().toLocaleDateString() };
@@ -180,18 +175,6 @@ export default function Home() {
 
           <h2 className="text-xs font-semibold text-gray-400 dark:text-[var(--muted)] uppercase tracking-wider mb-3">Settings</h2>
 
-          {/* HD toggle */}
-          <div className="flex items-center justify-between p-3 rounded-xl bg-gray-50 dark:bg-[var(--surface)] border border-gray-100 dark:border-[var(--border)] mb-3">
-            <div>
-              <p className="text-sm font-medium text-gray-700 dark:text-[var(--foreground)]">AI HD Upscaling</p>
-              <p className="text-[11px] text-gray-400 dark:text-[var(--muted)]">Real-ESRGAN 4×</p>
-            </div>
-            <button onClick={() => setUseAI(!useAI)}
-              className={`relative w-10 h-6 rounded-full transition-colors flex-shrink-0 ${useAI ? 'bg-indigo-500' : 'bg-gray-300 dark:bg-[var(--border)]'}`}>
-              <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow-sm transition-transform ${useAI ? 'translate-x-4' : ''}`} />
-            </button>
-          </div>
-
           {/* Output size checkboxes */}
           <div className="p-3 rounded-xl bg-gray-50 dark:bg-[var(--surface)] border border-gray-100 dark:border-[var(--border)] mb-3">
             <p className="text-sm font-medium text-gray-700 dark:text-[var(--foreground)] mb-2">Output sizes</p>
@@ -247,8 +230,7 @@ export default function Home() {
               <div className="flex items-center justify-between mb-4">
                 <h1 className="text-lg font-semibold text-gray-800 dark:text-[var(--foreground)]">Generated Icons</h1>
                 <div className="flex items-center gap-2 text-xs text-gray-400 dark:text-[var(--muted)]">
-                  {result.aiUsed && <><span className="w-2 h-2 rounded-full bg-green-400"></span> AI HD Upscaled</>}
-                  {result.upscaled && !result.aiUsed && <><span className="w-2 h-2 rounded-full bg-amber-400"></span> Upscaled</>}
+                  {result.upscaled && <><span className="w-2 h-2 rounded-full bg-amber-400"></span> Upscaled</>}
                 </div>
               </div>
 
