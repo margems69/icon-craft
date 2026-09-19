@@ -14,11 +14,14 @@ const SIZE_LABELS: Record<number, string> = {
 };
 
 export type FitMode = 'contain' | 'cover';
+export type IconShape = 'square' | 'rounded' | 'circle';
 
 export interface ProcessingOptions {
   fit: FitMode;
   padding: number;
   background: string;
+  shape?: IconShape;
+  borderRadius?: number;
 }
 
 export interface IconData {
@@ -41,6 +44,8 @@ const DEFAULT_OPTIONS: ProcessingOptions = {
   fit: 'contain',
   padding: 8,
   background: 'transparent',
+  shape: 'square',
+  borderRadius: 22,
 };
 
 function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
@@ -71,7 +76,34 @@ async function resizeImage(
   if (!ctx) throw new Error('Canvas is unavailable in this browser');
 
   ctx.clearRect(0, 0, targetSize, targetSize);
-  if (options.background !== 'transparent') {
+
+  if (options.shape === 'circle') {
+    ctx.beginPath();
+    ctx.arc(targetSize / 2, targetSize / 2, targetSize / 2, 0, Math.PI * 2);
+    ctx.closePath();
+    ctx.clip();
+  } else if (options.shape === 'rounded') {
+    const radiusPercent = options.borderRadius ?? 22;
+    const r = Math.min((targetSize * radiusPercent) / 100, targetSize / 2);
+    ctx.beginPath();
+    if (typeof ctx.roundRect === 'function') {
+      ctx.roundRect(0, 0, targetSize, targetSize, r);
+    } else {
+      ctx.moveTo(r, 0);
+      ctx.lineTo(targetSize - r, 0);
+      ctx.arcTo(targetSize, 0, targetSize, r, r);
+      ctx.lineTo(targetSize, targetSize - r);
+      ctx.arcTo(targetSize, targetSize, targetSize - r, targetSize, r);
+      ctx.lineTo(r, targetSize);
+      ctx.arcTo(0, targetSize, 0, targetSize - r, r);
+      ctx.lineTo(0, r);
+      ctx.arcTo(0, 0, r, 0, r);
+    }
+    ctx.closePath();
+    ctx.clip();
+  }
+
+  if (options.background && options.background !== 'transparent') {
     ctx.fillStyle = options.background;
     ctx.fillRect(0, 0, targetSize, targetSize);
   }
@@ -212,6 +244,7 @@ export async function processImage(
       `Source: ${originalWidth}x${originalHeight}`,
       `Fit: ${options.fit}`,
       `Padding: ${options.fit === 'contain' ? `${options.padding}%` : 'none'}`,
+      `Shape: ${options.shape || 'square'}${options.shape === 'rounded' ? ` (${options.borderRadius ?? 22}%)` : ''}`,
       `Background: ${options.background}`,
       '',
       'Chrome extension: copy the "icons" and "action.default_icon" values',
