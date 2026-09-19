@@ -97,9 +97,8 @@ async function upscaleWithSharp(inputBuffer: Buffer, scale: number): Promise<Buf
       m1: 0.5,
       m2: 2.0,
       x1: 0,
-      y1: 0,
       y2: 10,
-      x2: 1,
+      y3: 20,
     })
     .png({ compressionLevel: 9, palette: false })
     .toBuffer();

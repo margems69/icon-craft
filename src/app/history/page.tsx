@@ -13,8 +13,15 @@ export default function HistoryPage() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
 
   useEffect(() => {
-    const saved = localStorage.getItem('icon-craft-history');
-    if (saved) setHistory(JSON.parse(saved));
+    const timer = window.setTimeout(() => {
+      try {
+        const saved = localStorage.getItem('icon-craft-history');
+        if (saved) setHistory(JSON.parse(saved));
+      } catch {
+        localStorage.removeItem('icon-craft-history');
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, []);
 
   const clearHistory = () => {

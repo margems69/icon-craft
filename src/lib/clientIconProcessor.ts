@@ -1,6 +1,9 @@
 import JSZip from 'jszip';
 
-const ICON_SIZES = [16, 32, 48, 128, 256, 512];
+const ICON_SIZES = [16, 32, 48, 128, 256, 512] as const;
+const ICO_SIZES = [16, 32, 48, 128, 256] as const;
+const MAX_SOURCE_PIXELS = 64_000_000;
+
 const SIZE_LABELS: Record<number, string> = {
   16: 'Extension icon (16×16)',
   32: 'Extension icon (32×32)',
@@ -10,11 +13,19 @@ const SIZE_LABELS: Record<number, string> = {
   512: 'Desktop app icon (512×512)',
 };
 
+export type FitMode = 'contain' | 'cover';
+
+export interface ProcessingOptions {
+  fit: FitMode;
+  padding: number;
+  background: string;
+}
+
 export interface IconData {
   size: number;
   label: string;
   dataUrl: string;
-  format: string;
+  format: 'png';
 }
 
 export interface ConversionResult {
@@ -23,195 +34,217 @@ export interface ConversionResult {
   originalName: string;
   originalWidth: number;
   originalHeight: number;
-  upscaled?: boolean;
-  aiUsed?: boolean;
+  upscaled: boolean;
 }
 
-/**
- * Resize an image bitmap to the target size using canvas.
- * Uses lanczos-equivalent quality via canvas's imageSmoothingQuality.
- */
-function resizeImage(
-  img: HTMLImageElement | ImageBitmap,
-  targetSize: number
-): Promise<Blob> {
+const DEFAULT_OPTIONS: ProcessingOptions = {
+  fit: 'contain',
+  padding: 8,
+  background: 'transparent',
+};
+
+function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
   return new Promise((resolve, reject) => {
-    const canvas = document.createElement('canvas');
-    canvas.width = targetSize;
-    canvas.height = targetSize;
-    const ctx = canvas.getContext('2d')!;
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(img, 0, 0, targetSize, targetSize);
     canvas.toBlob(
-      (blob) => {
-        if (blob) resolve(blob);
-        else reject(new Error('Failed to encode PNG'));
-      },
+      (blob) => blob ? resolve(blob) : reject(new Error('Failed to encode PNG')),
       'image/png',
-      0.92
     );
   });
 }
 
 /**
- * Generate a simple ICO file wrapping a PNG image.
- * ICO format: 6-byte header + 16-byte directory entry + PNG data.
+ * Render without changing the source aspect ratio. Contain adds padding while
+ * cover fills the canvas and crops equally from opposing edges.
  */
-async function generateIco(pngBlob: Blob): Promise<Blob> {
-  const pngBuffer = await pngBlob.arrayBuffer();
-  const pngBytes = new Uint8Array(pngBuffer);
+async function resizeImage(
+  img: CanvasImageSource,
+  sourceWidth: number,
+  sourceHeight: number,
+  targetSize: number,
+  options: ProcessingOptions,
+): Promise<Blob> {
+  const canvas = document.createElement('canvas');
+  canvas.width = targetSize;
+  canvas.height = targetSize;
 
-  // ICO header: reserved(2) + type=1(2) + count=1(2)
-  const header = new Uint8Array(6);
-  header[2] = 1; // type = 1 (ICO)
-  header[4] = 1; // count = 1
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas is unavailable in this browser');
 
-  // Directory entry: w, h, colors, reserved, planes, bpp, size, offset
-  const dir = new Uint8Array(16);
-  // Width/height: 0 means 256
-  dir[0] = 0; // w = 256 (0 means 256)
-  dir[1] = 0; // h = 256
-  dir[4] = 1; // color planes
-  dir[5] = 32; // bits per pixel
-  // Size of image data
-  const size = pngBytes.length;
-  dir[8] = size & 0xff;
-  dir[9] = (size >> 8) & 0xff;
-  dir[10] = (size >> 16) & 0xff;
-  dir[11] = (size >> 24) & 0xff;
-  // Offset: header + directory = 22
-  const offset = 22;
-  dir[12] = offset & 0xff;
-  dir[13] = (offset >> 8) & 0xff;
-  dir[14] = (offset >> 16) & 0xff;
-  dir[15] = (offset >> 24) & 0xff;
+  ctx.clearRect(0, 0, targetSize, targetSize);
+  if (options.background !== 'transparent') {
+    ctx.fillStyle = options.background;
+    ctx.fillRect(0, 0, targetSize, targetSize);
+  }
 
-  const ico = new Uint8Array(22 + pngBytes.length);
-  ico.set(header, 0);
-  ico.set(dir, 6);
-  ico.set(pngBytes, 22);
+  const padding = options.fit === 'contain'
+    ? Math.round(targetSize * Math.min(Math.max(options.padding, 0), 40) / 100)
+    : 0;
+  const available = Math.max(1, targetSize - padding * 2);
+  const scale = options.fit === 'cover'
+    ? Math.max(targetSize / sourceWidth, targetSize / sourceHeight)
+    : Math.min(available / sourceWidth, available / sourceHeight);
+  const width = sourceWidth * scale;
+  const height = sourceHeight * scale;
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, (targetSize - width) / 2, (targetSize - height) / 2, width, height);
+
+  return canvasToBlob(canvas);
+}
+
+function writeUint32LE(target: Uint8Array, offset: number, value: number) {
+  target[offset] = value & 0xff;
+  target[offset + 1] = (value >>> 8) & 0xff;
+  target[offset + 2] = (value >>> 16) & 0xff;
+  target[offset + 3] = (value >>> 24) & 0xff;
+}
+
+/**
+ * Create a standards-compliant ICO containing PNG frames at common Windows
+ * icon sizes. In ICO metadata, a zero width/height byte represents 256.
+ */
+async function generateIco(frames: Array<{ size: number; blob: Blob }>): Promise<Blob> {
+  const buffers = await Promise.all(frames.map(({ blob }) => blob.arrayBuffer()));
+  const directorySize = 6 + frames.length * 16;
+  const payloadSize = buffers.reduce((total, buffer) => total + buffer.byteLength, 0);
+  const ico = new Uint8Array(directorySize + payloadSize);
+
+  ico[2] = 1;
+  ico[4] = frames.length & 0xff;
+  ico[5] = (frames.length >>> 8) & 0xff;
+
+  let payloadOffset = directorySize;
+  frames.forEach(({ size }, index) => {
+    const entryOffset = 6 + index * 16;
+    const buffer = buffers[index];
+    const encodedSize = size === 256 ? 0 : size;
+
+    ico[entryOffset] = encodedSize;
+    ico[entryOffset + 1] = encodedSize;
+    ico[entryOffset + 4] = 1;
+    ico[entryOffset + 6] = 32;
+    writeUint32LE(ico, entryOffset + 8, buffer.byteLength);
+    writeUint32LE(ico, entryOffset + 12, payloadOffset);
+    ico.set(new Uint8Array(buffer), payloadOffset);
+    payloadOffset += buffer.byteLength;
+  });
 
   return new Blob([ico], { type: 'image/x-icon' });
 }
 
-/**
- * Process an image file entirely on the client side.
- * Returns icons, ZIP as data URL, and metadata.
- */
+function safeBaseName(filename: string): string {
+  const withoutExtension = filename.replace(/\.[^.]+$/, '');
+  return withoutExtension
+    .normalize('NFKC')
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80) || 'icon';
+}
+
+async function decodeImage(file: File): Promise<ImageBitmap> {
+  try {
+    return await createImageBitmap(file);
+  } catch {
+    throw new Error('This browser could not decode the image. Try PNG, JPG, WebP, or AVIF.');
+  }
+}
+
 export async function processImage(
   file: File,
-  enabledSizes: number[]
+  enabledSizes: number[],
+  requestedOptions: Partial<ProcessingOptions> = {},
 ): Promise<ConversionResult> {
-  // Read the file as data URL
-  const dataUrl = await new Promise<string>((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(r.result as string);
-    r.onerror = () => reject(new Error('Failed to read file'));
-    r.readAsDataURL(file);
-  });
+  const options = { ...DEFAULT_OPTIONS, ...requestedOptions };
+  const sizes = ICON_SIZES.filter((size) => enabledSizes.includes(size));
+  if (sizes.length === 0) throw new Error('Select at least one output size.');
 
-  // Load image to get dimensions
-  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-    const image = new Image();
-    image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error('Failed to decode image'));
-    image.src = dataUrl;
-  });
-
-  const originalWidth = img.naturalWidth;
-  const originalHeight = img.naturalHeight;
-  const originalName = file.name.replace(/\.[^.]+$/, '');
-
-  // Upscale if source is smaller than 512px (simple canvas-based upscaling)
-  const maxRequiredSize = 512;
-  const needsUpscale = originalWidth < maxRequiredSize || originalHeight < maxRequiredSize;
-  let sourceImg = img;
-
-  if (needsUpscale) {
-    // Simple client-side upscaling: draw at larger size on canvas
-    const scale = Math.max(maxRequiredSize / originalWidth, maxRequiredSize / originalHeight);
-    const newWidth = Math.round(originalWidth * scale);
-    const newHeight = Math.round(originalHeight * scale);
-    const canvas = document.createElement('canvas');
-    canvas.width = newWidth;
-    canvas.height = newHeight;
-    const ctx = canvas.getContext('2d')!;
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(img, 0, 0, newWidth, newHeight);
-
-    const blob = await new Promise<Blob>((resolve, reject) => {
-      canvas.toBlob((b) => {
-        if (b) resolve(b);
-        else reject(new Error('Failed to encode upscaled image'));
-      }, 'image/png');
-    });
-
-    const upscaledUrl = URL.createObjectURL(blob);
-    sourceImg = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const image = new Image();
-      image.onload = () => resolve(image);
-      image.onerror = () => reject(new Error('Failed to decode upscaled image'));
-      image.src = upscaledUrl;
-    });
+  const image = await decodeImage(file);
+  const originalWidth = image.width;
+  const originalHeight = image.height;
+  if (originalWidth < 1 || originalHeight < 1) {
+    image.close();
+    throw new Error('The image has invalid dimensions.');
   }
-
-  // Filter sizes to only enabled ones
-  const sizes = ICON_SIZES.filter((s) => enabledSizes.includes(s));
-
-  // Generate icons for each size
-  const icons: IconData[] = [];
+  if (originalWidth * originalHeight > MAX_SOURCE_PIXELS) {
+    image.close();
+    throw new Error('The image dimensions are too large. Use an image under 64 megapixels.');
+  }
+  const originalName = safeBaseName(file.name);
+  const maxRequiredSize = Math.max(...sizes);
   const zip = new JSZip();
+  const icons: IconData[] = [];
 
-  for (const size of sizes) {
-    const pngBlob = await resizeImage(sourceImg, size);
-    const pngBuffer = await pngBlob.arrayBuffer();
+  try {
+    for (const size of sizes) {
+      const pngBlob = await resizeImage(image, originalWidth, originalHeight, size, options);
+      zip.file(`${originalName}-${size}x${size}.png`, pngBlob);
+      icons.push({
+        size,
+        label: SIZE_LABELS[size],
+        dataUrl: URL.createObjectURL(pngBlob),
+        format: 'png',
+      });
+    }
 
-    // Data URL for preview
-    const dataUrl = `data:image/png;base64,${bufferToBase64(pngBuffer)}`;
+    const icoFrames = await Promise.all(
+      ICO_SIZES.map(async (size) => ({
+        size,
+        blob: await resizeImage(image, originalWidth, originalHeight, size, options),
+      })),
+    );
+    zip.file(`${originalName}.ico`, await generateIco(icoFrames));
 
-    icons.push({
-      size,
-      label: SIZE_LABELS[size] || `${size}×${size}`,
-      dataUrl,
-      format: 'png',
+    const chromeIconMap = Object.fromEntries(
+      sizes
+        .filter((size) => size <= 128)
+        .map((size) => [String(size), `${originalName}-${size}x${size}.png`]),
+    );
+    zip.file('chrome-manifest-icons.json', JSON.stringify({
+      icons: chromeIconMap,
+      action: { default_icon: chromeIconMap },
+    }, null, 2));
+
+    zip.file('README.txt', [
+      `${originalName} icon bundle`,
+      '',
+      `Source: ${originalWidth}x${originalHeight}`,
+      `Fit: ${options.fit}`,
+      `Padding: ${options.fit === 'contain' ? `${options.padding}%` : 'none'}`,
+      `Background: ${options.background}`,
+      '',
+      'Chrome extension: copy the "icons" and "action.default_icon" values',
+      'from chrome-manifest-icons.json into your manifest.json.',
+      'Windows: use the included multi-resolution .ico file.',
+      '',
+      'Generated locally by Icon Craft. No image was uploaded.',
+    ].join('\r\n'));
+
+    const zipBlob = await zip.generateAsync({
+      type: 'blob',
+      compression: 'DEFLATE',
+      compressionOptions: { level: 6 },
     });
 
-    // Add to ZIP
-    zip.file(`${originalName}-${size}x${size}.png`, pngBuffer);
+    return {
+      icons,
+      zipDataUrl: URL.createObjectURL(zipBlob),
+      originalName,
+      originalWidth,
+      originalHeight,
+      upscaled: originalWidth < maxRequiredSize || originalHeight < maxRequiredSize,
+    };
+  } catch (error) {
+    icons.forEach(({ dataUrl }) => URL.revokeObjectURL(dataUrl));
+    throw error;
+  } finally {
+    image.close();
   }
-
-  // Generate ICO (32×32)
-  const icoPngBlob = await resizeImage(sourceImg, 32);
-  const icoBlob = await generateIco(icoPngBlob);
-  zip.file(`${originalName}-32x32.ico`, await icoBlob.arrayBuffer());
-
-  // Generate ZIP
-  const zipBlob = await zip.generateAsync({ type: 'blob' });
-  const zipBase64 = await blobToBase64(zipBlob);
-  const zipDataUrl = `data:application/zip;base64,${zipBase64}`;
-
-  return {
-    icons,
-    zipDataUrl,
-    originalName,
-    originalWidth,
-    originalHeight,
-    upscaled: needsUpscale,
-  };
 }
 
-function bufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
-async function blobToBase64(blob: Blob): Promise<string> {
-  const buffer = await blob.arrayBuffer();
-  return bufferToBase64(buffer);
+export function releaseConversionResult(result: ConversionResult | null) {
+  if (!result) return;
+  result.icons.forEach(({ dataUrl }) => URL.revokeObjectURL(dataUrl));
+  URL.revokeObjectURL(result.zipDataUrl);
 }
